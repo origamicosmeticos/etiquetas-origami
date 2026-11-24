@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Html5Qrcode, Html5QrcodeSupportedFormats } from 'html5-qrcode'
-import { Camera, CameraOff, Flashlight, Search, X, ZoomIn } from 'lucide-react'
+import {
+  Camera,
+  CameraOff,
+  Flashlight,
+  RefreshCw,
+  Search,
+  X,
+  ZoomIn,
+} from 'lucide-react'
 
 interface BarcodeScannerProps {
   ean: string
@@ -20,14 +28,31 @@ interface ExtendedConstraintSet extends MediaTrackConstraintSet {
   torch?: boolean
 }
 
+interface DetectedBarcode {
+  rawValue: string
+}
+
+interface BarcodeDetectorInstance {
+  detect(source: ImageBitmapSource): Promise<DetectedBarcode[]>
+}
+
+interface BarcodeDetectorConstructor {
+  new (options?: { formats?: string[] }): BarcodeDetectorInstance
+  getSupportedFormats?: () => Promise<string[]>
+}
+
 const SCANNER_REGION_ID = 'qr-reader'
+
+function getBarcodeDetectorCtor(): BarcodeDetectorConstructor | null {
+  const win = window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }
+  return win.BarcodeDetector ?? null
+}
 
 function isValidEanCheckDigit(code: string): boolean {
   if (!/^\d{8}$|^\d{13}$/.test(code)) return false
   const digits = code.split('').map(Number)
   const checkDigit = digits[digits.length - 1]
   let sum = 0
-  // Da direita para a esquerda (excluindo o dígito verificador), pesos alternam 3, 1, 3, 1...
   for (let i = digits.length - 2, pos = 0; i >= 0; i--, pos++) {
     sum += digits[i] * (pos % 2 === 0 ? 3 : 1)
   }
@@ -35,63 +60,41 @@ function isValidEanCheckDigit(code: string): boolean {
   return expected === checkDigit
 }
 
-async function selectMainRearCameraId(): Promise<string | null> {
-  if (!navigator.mediaDevices?.enumerateDevices) return null
+async function listRearCameras(): Promise<MediaDeviceInfo[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return []
 
   let devices = await navigator.mediaDevices.enumerateDevices()
   let videoInputs = devices.filter((d) => d.kind === 'videoinput')
 
-  // Se os labels vierem vazios (permissão ainda não concedida), solicita permissão brevemente
+  // Se os labels vierem vazios, solicita permissão brevemente para expor os nomes das lentes
   if (videoInputs.length > 0 && videoInputs.every((d) => !d.label)) {
     try {
       const tempStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment' },
+        audio: false,
       })
       tempStream.getTracks().forEach((t) => t.stop())
       devices = await navigator.mediaDevices.enumerateDevices()
       videoInputs = devices.filter((d) => d.kind === 'videoinput')
     } catch {
-      return null
+      return []
     }
   }
 
-  if (videoInputs.length === 0) return null
-
-  // Filtra câmeras traseiras (evita frontais)
-  const rearCandidates = videoInputs.filter((d) => {
-    const label = d.label.toLowerCase()
-    const isFront = /front|user|selfie|frontal/.test(label)
-    if (isFront) return false
-    return /back|rear|traseira|environment/.test(label) || videoInputs.length === 1
-  })
-
-  const pool = rearCandidates.length > 0
-    ? rearCandidates
-    : videoInputs.filter((d) => !/front|user|selfie|frontal/i.test(d.label))
-
-  if (pool.length === 0) return null
-
-  // Exclui lentes ultra-wide / macro ("ultra", "wide", "0.5", "0.6")
-  const nonUltraWide = pool.filter(
-    (d) => !/ultra|wide|0\.5|0\.6/i.test(d.label)
+  const rear = videoInputs.filter(
+    (d) => !/front|user|selfie|frontal/i.test(d.label)
   )
-  const candidates = nonUltraWide.length > 0 ? nonUltraWide : pool
+  const pool = rear.length > 0 ? rear : videoInputs
 
-  // Prefere câmera principal ("back 0", "camera2 0", "main")
-  const mainCam =
-    candidates.find((d) => /back\s*0|camera2\s*0|main|principal/i.test(d.label)) ??
-    candidates[0]
-
-  return mainCam?.deviceId || null
-}
-
-function getActiveVideoTrack(): MediaStreamTrack | null {
-  const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_REGION_ID} video`)
-  const stream = video?.srcObject
-  if (stream instanceof MediaStream) {
-    return stream.getVideoTracks()[0] ?? null
-  }
-  return null
+  // Ordena colocando lentes principais primeiro e ultra-wide/macro depois
+  return [...pool].sort((a, b) => {
+    const score = (label: string) => {
+      if (/ultra|wide|0\.5|0\.6/i.test(label)) return 2
+      if (/back\s*0|camera2\s*0|main|principal/i.test(label)) return 0
+      return 1
+    }
+    return score(a.label) - score(b.label)
+  })
 }
 
 export function BarcodeScanner({
@@ -100,12 +103,18 @@ export function BarcodeScanner({
   onBarcodeDetected,
 }: BarcodeScannerProps) {
   const [cameraActive, setCameraActive] = useState(false)
+  const [usingNativeDetector, setUsingNativeDetector] = useState(false)
+  const [rearCameras, setRearCameras] = useState<MediaDeviceInfo[]>([])
+  const [lensIndex, setLensIndex] = useState(0)
   const [torchOn, setTorchOn] = useState(false)
   const [torchSupported, setTorchSupported] = useState(false)
   const [zoom2x, setZoom2x] = useState(false)
   const [cssZoomFallback, setCssZoomFallback] = useState(false)
   const [cameraError, setCameraError] = useState<string | null>(null)
 
+  const nativeVideoRef = useRef<HTMLVideoElement | null>(null)
+  const nativeStreamRef = useRef<MediaStream | null>(null)
+  const rafIdRef = useRef<number | null>(null)
   const scannerRef = useRef<Html5Qrcode | null>(null)
   const lastScanRef = useRef<{ code: string; ts: number }>({ code: '', ts: 0 })
   const consecutiveScanRef = useRef<{ code: string; count: number }>({
@@ -118,7 +127,63 @@ export function BarcodeScanner({
     onDetectedRef.current = onBarcodeDetected
   }, [onBarcodeDetected])
 
+  const getActiveTrack = useCallback((): MediaStreamTrack | null => {
+    if (nativeStreamRef.current) {
+      return nativeStreamRef.current.getVideoTracks()[0] ?? null
+    }
+    const video = document.querySelector<HTMLVideoElement>(
+      `#${SCANNER_REGION_ID} video`
+    )
+    const stream = video?.srcObject
+    if (stream instanceof MediaStream) {
+      return stream.getVideoTracks()[0] ?? null
+    }
+    return null
+  }, [])
+
+  const handleDecodedCandidate = useCallback((decodedText: string) => {
+    const clean = decodedText.replace(/\D/g, '')
+    if (!isValidEanCheckDigit(clean)) return
+
+    if (consecutiveScanRef.current.code === clean) {
+      consecutiveScanRef.current.count += 1
+    } else {
+      consecutiveScanRef.current = { code: clean, count: 1 }
+    }
+
+    if (consecutiveScanRef.current.count < 2) return
+
+    const now = Date.now()
+    if (
+      lastScanRef.current.code === clean &&
+      now - lastScanRef.current.ts < 2200
+    ) {
+      return
+    }
+
+    consecutiveScanRef.current = { code: '', count: 0 }
+    lastScanRef.current = { code: clean, ts: now }
+    if (navigator.vibrate) {
+      navigator.vibrate(40)
+    }
+    onDetectedRef.current(clean)
+  }, [])
+
   const stopCamera = useCallback(async () => {
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current)
+      rafIdRef.current = null
+    }
+
+    if (nativeStreamRef.current) {
+      nativeStreamRef.current.getTracks().forEach((t) => t.stop())
+      nativeStreamRef.current = null
+    }
+
+    if (nativeVideoRef.current) {
+      nativeVideoRef.current.srcObject = null
+    }
+
     const instance = scannerRef.current
     if (instance) {
       try {
@@ -131,124 +196,175 @@ export function BarcodeScanner({
       }
       scannerRef.current = null
     }
+
     consecutiveScanRef.current = { code: '', count: 0 }
     setCameraActive(false)
+    setUsingNativeDetector(false)
     setTorchOn(false)
     setTorchSupported(false)
     setZoom2x(false)
     setCssZoomFallback(false)
   }, [])
 
-  const startCamera = useCallback(async () => {
-    setCameraError(null)
-    consecutiveScanRef.current = { code: '', count: 0 }
+  const configureActiveTrack = useCallback(async (track: MediaStreamTrack | null) => {
+    if (!track) return
     try {
-      const mainCameraId = await selectMainRearCameraId()
-      const cameraConfig: string | MediaTrackConstraints = mainCameraId
-        ? { deviceId: { exact: mainCameraId } }
-        : { facingMode: 'environment' }
+      const caps = track.getCapabilities?.() as
+        | ExtendedMediaTrackCapabilities
+        | undefined
+      if (caps?.focusMode?.includes('continuous')) {
+        await track.applyConstraints({
+          advanced: [{ focusMode: 'continuous' } as ExtendedConstraintSet],
+        })
+      }
+      if (caps?.torch) {
+        setTorchSupported(true)
+      }
+    } catch {
+      // ignore unsupported track constraints
+    }
+  }, [])
 
-      const scanner = new Html5Qrcode(SCANNER_REGION_ID, {
-        formatsToSupport: [
-          Html5QrcodeSupportedFormats.EAN_13,
-          Html5QrcodeSupportedFormats.EAN_8,
-        ],
-        verbose: false,
-      })
-      scannerRef.current = scanner
+  const startCameraWithLens = useCallback(
+    async (targetLensIdx: number) => {
+      await stopCamera()
+      setCameraError(null)
 
-      await scanner.start(
-        cameraConfig,
-        {
-          fps: 12,
-          aspectRatio: 4 / 3,
-          qrbox: (viewfinderWidth, viewfinderHeight) => ({
-            width: Math.min(340, Math.round(viewfinderWidth * 0.85)),
-            height: Math.min(140, Math.round(viewfinderHeight * 0.42)),
-          }),
-          videoConstraints: {
-            ...(mainCameraId
-              ? { deviceId: { exact: mainCameraId } }
-              : { facingMode: 'environment' }),
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
-        },
-        (decodedText) => {
-          const clean = decodedText.replace(/\D/g, '')
-          if (!isValidEanCheckDigit(clean)) {
-            return
-          }
+      try {
+        const cameras = await listRearCameras()
+        setRearCameras(cameras)
 
-          // Exige 2 leituras consecutivas idênticas para evitar leituras parciais/erradas
-          if (consecutiveScanRef.current.code === clean) {
-            consecutiveScanRef.current.count += 1
-          } else {
-            consecutiveScanRef.current = { code: clean, count: 1 }
-          }
+        const safeIndex =
+          cameras.length > 0 ? targetLensIdx % cameras.length : 0
+        setLensIndex(safeIndex)
+        const chosenDeviceId = cameras[safeIndex]?.deviceId
 
-          if (consecutiveScanRef.current.count < 2) {
-            return
-          }
-
-          const now = Date.now()
-          if (
-            lastScanRef.current.code === clean &&
-            now - lastScanRef.current.ts < 2200
-          ) {
-            return
-          }
-
-          consecutiveScanRef.current = { code: '', count: 0 }
-          lastScanRef.current = { code: clean, ts: now }
-          if (navigator.vibrate) {
-            navigator.vibrate(40)
-          }
-          onDetectedRef.current(clean)
-        },
-        () => {
-          // frame without barcode - expected
+        const baseVideoConstraints: MediaTrackConstraints = {
+          ...(chosenDeviceId
+            ? { deviceId: { exact: chosenDeviceId } }
+            : { facingMode: 'environment' }),
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
         }
-      )
 
-      setCameraActive(true)
+        // 1. Preferência: BarcodeDetector nativo (ML Kit no Chrome Android)
+        const DetectorCtor = getBarcodeDetectorCtor()
+        if (DetectorCtor && nativeVideoRef.current) {
+          try {
+            let supportsEan = true
+            if (DetectorCtor.getSupportedFormats) {
+              const supported = await DetectorCtor.getSupportedFormats()
+              supportsEan =
+                supported.includes('ean_13') || supported.includes('ean_8')
+            }
 
-      // Configura foco automático contínuo e verifica lanterna na track ativa
-      const track = getActiveVideoTrack()
-      if (track) {
-        try {
-          const caps = track.getCapabilities?.() as ExtendedMediaTrackCapabilities | undefined
-          if (caps?.focusMode?.includes('continuous')) {
-            await track.applyConstraints({
-              advanced: [{ focusMode: 'continuous' } as ExtendedConstraintSet],
-            })
+            if (supportsEan) {
+              const detector = new DetectorCtor({
+                formats: ['ean_13', 'ean_8'],
+              })
+              const stream = await navigator.mediaDevices.getUserMedia({
+                video: baseVideoConstraints,
+                audio: false,
+              })
+
+              nativeStreamRef.current = stream
+              const videoEl = nativeVideoRef.current
+              videoEl.srcObject = stream
+              await videoEl.play()
+
+              setUsingNativeDetector(true)
+              setCameraActive(true)
+
+              const track = stream.getVideoTracks()[0] ?? null
+              await configureActiveTrack(track)
+
+              let detecting = false
+              const scanLoop = () => {
+                if (!nativeStreamRef.current || !nativeVideoRef.current) return
+                if (!detecting && nativeVideoRef.current.readyState >= 2) {
+                  detecting = true
+                  detector
+                    .detect(nativeVideoRef.current)
+                    .then((barcodes) => {
+                      if (barcodes.length > 0 && barcodes[0].rawValue) {
+                        handleDecodedCandidate(barcodes[0].rawValue)
+                      }
+                    })
+                    .catch(() => {
+                      // ignore transient frame decode errors
+                    })
+                    .finally(() => {
+                      detecting = false
+                    })
+                }
+                rafIdRef.current = requestAnimationFrame(scanLoop)
+              }
+              rafIdRef.current = requestAnimationFrame(scanLoop)
+              return
+            }
+          } catch {
+            // Se falhar, cai no fallback html5-qrcode abaixo
+            if (nativeStreamRef.current) {
+              nativeStreamRef.current.getTracks().forEach((t) => t.stop())
+              nativeStreamRef.current = null
+            }
           }
-          if (caps?.torch) {
+        }
+
+        // 2. Fallback: html5-qrcode (apenas EAN-13 e EAN-8)
+        const scanner = new Html5Qrcode(SCANNER_REGION_ID, {
+          formatsToSupport: [
+            Html5QrcodeSupportedFormats.EAN_13,
+            Html5QrcodeSupportedFormats.EAN_8,
+          ],
+          verbose: false,
+        })
+        scannerRef.current = scanner
+
+        await scanner.start(
+          chosenDeviceId
+            ? { deviceId: { exact: chosenDeviceId } }
+            : { facingMode: 'environment' },
+          {
+            fps: 12,
+            aspectRatio: 4 / 3,
+            qrbox: (viewfinderWidth, viewfinderHeight) => ({
+              width: Math.round(viewfinderWidth * 0.9),
+              height: Math.round(viewfinderHeight * 0.7),
+            }),
+            videoConstraints: baseVideoConstraints,
+          },
+          (decodedText) => handleDecodedCandidate(decodedText),
+          () => {
+            // frame without barcode
+          }
+        )
+
+        setUsingNativeDetector(false)
+        setCameraActive(true)
+
+        await configureActiveTrack(getActiveTrack())
+        try {
+          const torchFeature = scanner
+            .getRunningTrackCameraCapabilities()
+            .torchFeature()
+          if (torchFeature.isSupported()) {
             setTorchSupported(true)
           }
         } catch {
-          // Alguns aparelhos não expõem focusMode/torch via capabilities
+          // ignore
         }
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Não foi possível acessar a câmera traseira.'
+        setCameraError(msg)
+        await stopCamera()
       }
-
-      try {
-        const capabilities = scanner.getRunningTrackCameraCapabilities()
-        const torchFeature = capabilities.torchFeature()
-        if (torchFeature.isSupported()) {
-          setTorchSupported(true)
-        }
-      } catch {
-        // ignore
-      }
-    } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : 'Não foi possível acessar a câmera traseira.'
-      setCameraError(msg)
-      await stopCamera()
-    }
-  }, [stopCamera])
+    },
+    [configureActiveTrack, getActiveTrack, handleDecodedCandidate, stopCamera]
+  )
 
   useEffect(() => {
     return () => {
@@ -260,33 +376,42 @@ export function BarcodeScanner({
     if (cameraActive) {
       void stopCamera()
     } else {
-      void startCamera()
+      void startCameraWithLens(lensIndex)
     }
   }
 
+  const handleCycleLens = () => {
+    if (rearCameras.length <= 1) return
+    const nextIdx = (lensIndex + 1) % rearCameras.length
+    void startCameraWithLens(nextIdx)
+  }
+
   const handleToggleTorch = async () => {
-    const scanner = scannerRef.current
-    if (!scanner || !cameraActive) return
+    if (!cameraActive) return
     const next = !torchOn
-    try {
-      const torchFeature = scanner.getRunningTrackCameraCapabilities().torchFeature()
-      if (torchFeature.isSupported()) {
-        await torchFeature.apply(next)
-        setTorchOn(next)
-        return
+
+    if (scannerRef.current) {
+      try {
+        const torchFeature = scannerRef.current
+          .getRunningTrackCameraCapabilities()
+          .torchFeature()
+        if (torchFeature.isSupported()) {
+          await torchFeature.apply(next)
+          setTorchOn(next)
+          return
+        }
+      } catch {
+        // fallback via track
       }
-    } catch {
-      // fallback via MediaStreamTrack
     }
 
-    const track = getActiveVideoTrack()
+    const track = getActiveTrack()
     if (track) {
       try {
         await track.applyConstraints({
           advanced: [{ torch: next } as ExtendedConstraintSet],
         })
         setTorchOn(next)
-        return
       } catch {
         setTorchSupported(false)
       }
@@ -296,26 +421,26 @@ export function BarcodeScanner({
   const handleToggleZoom = async () => {
     if (!cameraActive) return
     const nextZoom2x = !zoom2x
-    const targetZoom = nextZoom2x ? 2 : 1
-    const track = getActiveVideoTrack()
+    const track = getActiveTrack()
 
     if (track) {
       try {
-        const caps = track.getCapabilities?.() as ExtendedMediaTrackCapabilities | undefined
+        const caps = track.getCapabilities?.() as
+          | ExtendedMediaTrackCapabilities
+          | undefined
         if (caps?.zoom) {
-          const clampedZoom = Math.min(
-            caps.zoom.max,
-            Math.max(caps.zoom.min, targetZoom)
-          )
+          const targetZoom = nextZoom2x
+            ? Math.min(2, caps.zoom.max)
+            : Math.max(1, caps.zoom.min)
           await track.applyConstraints({
-            advanced: [{ zoom: clampedZoom } as ExtendedConstraintSet],
+            advanced: [{ zoom: targetZoom } as ExtendedConstraintSet],
           })
           setCssZoomFallback(false)
           setZoom2x(nextZoom2x)
           return
         }
       } catch {
-        // Fallback visual caso applyConstraints de zoom falhe
+        // Fallback visual no <video> mantendo resolução nativa 1920x1080
       }
     }
 
@@ -343,11 +468,40 @@ export function BarcodeScanner({
     <section className="space-y-2.5 rounded-2xl border border-neutral-200 bg-white p-3 shadow-2xs">
       {/* Área do leitor de câmera */}
       <div className="relative overflow-hidden rounded-xl bg-neutral-900">
+        {/* Vídeo nativo para BarcodeDetector */}
+        <div
+          className={`relative w-full overflow-hidden ${
+            cameraActive && usingNativeDetector
+              ? 'aspect-[4/3] min-h-[260px]'
+              : 'hidden'
+          }`}
+        >
+          <video
+            ref={nativeVideoRef}
+            playsInline
+            muted
+            className={`h-full w-full object-cover transition-transform ${
+              cssZoomFallback ? 'scale-200' : 'scale-100'
+            }`}
+          />
+          {/* Mira retangular larga 90% x 70% */}
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div className="h-[70%] w-[90%] rounded-xl border-2 border-emerald-400/80 shadow-[0_0_0_9999px_rgba(0,0,0,0.32)]" />
+          </div>
+        </div>
+
+        {/* Fallback html5-qrcode */}
         <div
           id={SCANNER_REGION_ID}
           className={`w-full overflow-hidden transition-all ${
-            cameraActive ? 'aspect-[4/3] min-h-[260px]' : 'h-0'
-          } ${cssZoomFallback ? '[&_video]:scale-200 [&_video]:transition-transform' : '[&_video]:scale-100 [&_video]:transition-transform'}`}
+            cameraActive && !usingNativeDetector
+              ? 'aspect-[4/3] min-h-[260px]'
+              : 'h-0'
+          } ${
+            cssZoomFallback
+              ? '[&_video]:scale-200 [&_video]:transition-transform'
+              : '[&_video]:scale-100 [&_video]:transition-transform'
+          }`}
         />
 
         {!cameraActive && (
@@ -362,7 +516,18 @@ export function BarcodeScanner({
         )}
 
         {cameraActive && (
-          <div className="absolute right-2.5 bottom-2.5 z-10 flex items-center gap-2">
+          <div className="absolute right-2.5 bottom-2.5 left-2.5 z-10 flex flex-wrap items-center justify-end gap-1.5">
+            {rearCameras.length > 1 && (
+              <button
+                type="button"
+                onClick={handleCycleLens}
+                aria-label="Trocar lente"
+                className="flex h-10 items-center gap-1.5 rounded-xl bg-black/60 px-3 text-xs font-bold text-white backdrop-blur-md active:scale-95"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Lente {lensIndex + 1}/{rearCameras.length}
+              </button>
+            )}
             <button
               type="button"
               onClick={handleToggleZoom}
