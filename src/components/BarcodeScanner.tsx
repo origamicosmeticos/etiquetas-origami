@@ -22,6 +22,69 @@ interface ExtendedConstraintSet extends MediaTrackConstraintSet {
 
 const SCANNER_REGION_ID = 'qr-reader'
 
+function isValidEanCheckDigit(code: string): boolean {
+  if (!/^\d{8}$|^\d{13}$/.test(code)) return false
+  const digits = code.split('').map(Number)
+  const checkDigit = digits[digits.length - 1]
+  let sum = 0
+  // Da direita para a esquerda (excluindo o dígito verificador), pesos alternam 3, 1, 3, 1...
+  for (let i = digits.length - 2, pos = 0; i >= 0; i--, pos++) {
+    sum += digits[i] * (pos % 2 === 0 ? 3 : 1)
+  }
+  const expected = (10 - (sum % 10)) % 10
+  return expected === checkDigit
+}
+
+async function selectMainRearCameraId(): Promise<string | null> {
+  if (!navigator.mediaDevices?.enumerateDevices) return null
+
+  let devices = await navigator.mediaDevices.enumerateDevices()
+  let videoInputs = devices.filter((d) => d.kind === 'videoinput')
+
+  // Se os labels vierem vazios (permissão ainda não concedida), solicita permissão brevemente
+  if (videoInputs.length > 0 && videoInputs.every((d) => !d.label)) {
+    try {
+      const tempStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+      })
+      tempStream.getTracks().forEach((t) => t.stop())
+      devices = await navigator.mediaDevices.enumerateDevices()
+      videoInputs = devices.filter((d) => d.kind === 'videoinput')
+    } catch {
+      return null
+    }
+  }
+
+  if (videoInputs.length === 0) return null
+
+  // Filtra câmeras traseiras (evita frontais)
+  const rearCandidates = videoInputs.filter((d) => {
+    const label = d.label.toLowerCase()
+    const isFront = /front|user|selfie|frontal/.test(label)
+    if (isFront) return false
+    return /back|rear|traseira|environment/.test(label) || videoInputs.length === 1
+  })
+
+  const pool = rearCandidates.length > 0
+    ? rearCandidates
+    : videoInputs.filter((d) => !/front|user|selfie|frontal/i.test(d.label))
+
+  if (pool.length === 0) return null
+
+  // Exclui lentes ultra-wide / macro ("ultra", "wide", "0.5", "0.6")
+  const nonUltraWide = pool.filter(
+    (d) => !/ultra|wide|0\.5|0\.6/i.test(d.label)
+  )
+  const candidates = nonUltraWide.length > 0 ? nonUltraWide : pool
+
+  // Prefere câmera principal ("back 0", "camera2 0", "main")
+  const mainCam =
+    candidates.find((d) => /back\s*0|camera2\s*0|main|principal/i.test(d.label)) ??
+    candidates[0]
+
+  return mainCam?.deviceId || null
+}
+
 function getActiveVideoTrack(): MediaStreamTrack | null {
   const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_REGION_ID} video`)
   const stream = video?.srcObject
@@ -45,6 +108,10 @@ export function BarcodeScanner({
 
   const scannerRef = useRef<Html5Qrcode | null>(null)
   const lastScanRef = useRef<{ code: string; ts: number }>({ code: '', ts: 0 })
+  const consecutiveScanRef = useRef<{ code: string; count: number }>({
+    code: '',
+    count: 0,
+  })
   const onDetectedRef = useRef(onBarcodeDetected)
 
   useEffect(() => {
@@ -64,6 +131,7 @@ export function BarcodeScanner({
       }
       scannerRef.current = null
     }
+    consecutiveScanRef.current = { code: '', count: 0 }
     setCameraActive(false)
     setTorchOn(false)
     setTorchSupported(false)
@@ -73,7 +141,13 @@ export function BarcodeScanner({
 
   const startCamera = useCallback(async () => {
     setCameraError(null)
+    consecutiveScanRef.current = { code: '', count: 0 }
     try {
+      const mainCameraId = await selectMainRearCameraId()
+      const cameraConfig: string | MediaTrackConstraints = mainCameraId
+        ? { deviceId: { exact: mainCameraId } }
+        : { facingMode: 'environment' }
+
       const scanner = new Html5Qrcode(SCANNER_REGION_ID, {
         formatsToSupport: [
           Html5QrcodeSupportedFormats.EAN_13,
@@ -84,7 +158,7 @@ export function BarcodeScanner({
       scannerRef.current = scanner
 
       await scanner.start(
-        { facingMode: 'environment' },
+        cameraConfig,
         {
           fps: 12,
           aspectRatio: 4 / 3,
@@ -93,14 +167,29 @@ export function BarcodeScanner({
             height: Math.min(140, Math.round(viewfinderHeight * 0.42)),
           }),
           videoConstraints: {
-            facingMode: 'environment',
+            ...(mainCameraId
+              ? { deviceId: { exact: mainCameraId } }
+              : { facingMode: 'environment' }),
             width: { ideal: 1920 },
             height: { ideal: 1080 },
           },
         },
         (decodedText) => {
           const clean = decodedText.replace(/\D/g, '')
-          if (!clean) return
+          if (!isValidEanCheckDigit(clean)) {
+            return
+          }
+
+          // Exige 2 leituras consecutivas idênticas para evitar leituras parciais/erradas
+          if (consecutiveScanRef.current.code === clean) {
+            consecutiveScanRef.current.count += 1
+          } else {
+            consecutiveScanRef.current = { code: clean, count: 1 }
+          }
+
+          if (consecutiveScanRef.current.count < 2) {
+            return
+          }
 
           const now = Date.now()
           if (
@@ -110,6 +199,7 @@ export function BarcodeScanner({
             return
           }
 
+          consecutiveScanRef.current = { code: '', count: 0 }
           lastScanRef.current = { code: clean, ts: now }
           if (navigator.vibrate) {
             navigator.vibrate(40)
